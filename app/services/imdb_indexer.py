@@ -1,11 +1,9 @@
 """IMDB dataset indexer and search service."""
 
-import json
 import gzip
 import os
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from fuzzywuzzy import fuzz
-from fuzzywuzzy import process
 import pickle
 
 # title.episode.tsv.gz columns:
@@ -27,6 +25,8 @@ class IMDBIndexer:
         self.title_lookup = {}  # {normalized_title: [imdb_ids]}
         self.year_index = {}  # {year: [imdb_ids]}
         self.episode_index = {}  # {episode_tconst: {parent_tconst, season, episode}}
+        self._search_cache: Dict[Tuple[str, Optional[int], Optional[bool], int], List[Dict]] = {}
+        self._cache_limit = 1024
         
         self._ensure_index_dir()
         self._load_or_create_index()
@@ -39,6 +39,7 @@ class IMDBIndexer:
         """Load existing index or create empty one."""
         index_file = os.path.join(self.index_path, 'titles_index.pkl')
         lookup_file = os.path.join(self.index_path, 'title_lookup.pkl')
+        year_file = os.path.join(self.index_path, 'year_index.pkl')
         episode_file = os.path.join(self.index_path, 'episode_index.pkl')
 
         if os.path.exists(index_file) and os.path.exists(lookup_file):
@@ -47,10 +48,14 @@ class IMDBIndexer:
                     self.titles_index = pickle.load(f)
                 with open(lookup_file, 'rb') as f:
                     self.title_lookup = pickle.load(f)
+                if os.path.exists(year_file):
+                    with open(year_file, 'rb') as f:
+                        self.year_index = pickle.load(f)
             except Exception as e:
                 print(f"Error loading index: {e}. Creating new index.")
                 self.titles_index = {}
                 self.title_lookup = {}
+                self.year_index = {}
 
         if os.path.exists(episode_file):
             try:
@@ -59,6 +64,18 @@ class IMDBIndexer:
             except Exception as e:
                 print(f"Error loading episode index: {e}.")
                 self.episode_index = {}
+
+        # Backward compatibility with older index files that don't persist year index.
+        if self.titles_index and not self.year_index:
+            self._rebuild_year_index()
+
+    def _rebuild_year_index(self):
+        """Rebuild year index from titles_index."""
+        self.year_index = {}
+        for imdb_id, info in self.titles_index.items():
+            year = info.get('year')
+            if year:
+                self.year_index.setdefault(year, []).append(imdb_id)
     
     def add_title(self, imdb_id: str, title: str, title_type: str, year: Optional[int] = None,
                   is_series: bool = False, episode_count: Optional[int] = None):
@@ -115,6 +132,10 @@ class IMDBIndexer:
         
         # Normalize search title
         normalized_title = self._normalize_title(title)
+        cache_key = (normalized_title, year, is_series, int(threshold * 100))
+        cached = self._search_cache.get(cache_key)
+        if cached is not None:
+            return cached
         
         # Try exact match first
         if normalized_title in self.title_lookup:
@@ -124,19 +145,49 @@ class IMDBIndexer:
                 if self._matches_filters(title_info, year, is_series):
                     results.append({**title_info, 'score': 1.0})
             if results:
+                self._cache_result(cache_key, results)
                 return results
-        
-        # Fuzzy search
+
+        # Build candidates by year first to avoid scanning the full corpus.
+        candidate_ids = None
+        if year:
+            ids = set()
+            for y in (year - 1, year, year + 1):
+                ids.update(self.year_index.get(y, []))
+            if ids:
+                candidate_ids = ids
+
+        if candidate_ids is None:
+            candidate_ids = set(self.titles_index.keys())
+
+        # Apply series filter before fuzzy scoring.
+        filtered_ids = []
+        for imdb_id in candidate_ids:
+            info = self.titles_index[imdb_id]
+            if is_series is None or info.get('is_series') == is_series:
+                filtered_ids.append(imdb_id)
+
+        if not filtered_ids:
+            return []
+
+        # Score only filtered candidates to avoid full-index scan.
         results = []
-        for imdb_id, title_info in self.titles_index.items():
-            score = fuzz.token_set_ratio(title, title_info['title']) / 100.0
-            
-            if score >= threshold and self._matches_filters(title_info, year, is_series):
-                results.append({**title_info, 'score': score})
-        
-        # Sort by score
+        for imdb_id in filtered_ids:
+            info = self.titles_index[imdb_id]
+            score = fuzz.token_set_ratio(title, info['title']) / 100.0
+            if score >= threshold:
+                results.append({**info, 'score': score})
+
         results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:10]  # Return top 10
+        results = results[:10]
+        self._cache_result(cache_key, results)
+        return results
+
+    def _cache_result(self, key: Tuple[str, Optional[int], Optional[bool], int], value: List[Dict]):
+        """Tiny in-memory cache for frequent repeated searches."""
+        if len(self._search_cache) >= self._cache_limit:
+            self._search_cache.pop(next(iter(self._search_cache)))
+        self._search_cache[key] = value
     
     def _normalize_title(self, title: str) -> str:
         """Normalize title for comparison."""
@@ -159,6 +210,7 @@ class IMDBIndexer:
         """Save index to disk."""
         index_file = os.path.join(self.index_path, 'titles_index.pkl')
         lookup_file = os.path.join(self.index_path, 'title_lookup.pkl')
+        year_file = os.path.join(self.index_path, 'year_index.pkl')
         episode_file = os.path.join(self.index_path, 'episode_index.pkl')
 
         try:
@@ -166,6 +218,8 @@ class IMDBIndexer:
                 pickle.dump(self.titles_index, f)
             with open(lookup_file, 'wb') as f:
                 pickle.dump(self.title_lookup, f)
+            with open(year_file, 'wb') as f:
+                pickle.dump(self.year_index, f)
             if self.episode_index:
                 with open(episode_file, 'wb') as f:
                     pickle.dump(self.episode_index, f)
