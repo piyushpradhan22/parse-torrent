@@ -1,6 +1,7 @@
 """API routes for torrent parsing."""
 
 import os
+import re
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from app.models.schemas import TorrentQuery, TorrentResponse, TorrentParsedInfo, EpisodeInfo
 from app.core.torrent_parser import TorrentParser
@@ -33,6 +34,41 @@ def _resolve_file_text(query: TorrentQuery) -> str:
         return ""
     normalized = query.torrent_file.replace('\\', '/')
     return os.path.basename(normalized)
+
+
+def _clean_imdb_search_title(title: str) -> str:
+    """Normalize noisy release strings into a cleaner IMDb search title."""
+    if not title:
+        return ""
+
+    t = title
+    t = re.sub(r"\[[^\]]*\]|\([^\)]*\)", " ", t)
+    t = re.sub(r"\bS\d{1,2}E\d{1,2}\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bS\d{1,2}\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bSeason\s*\d{1,2}\b", " ", t, flags=re.IGNORECASE)
+
+    # Strip common non-title terms found in torrent names.
+    t = re.sub(
+        r"\b(Dual\s*Audio|Multi|MULTi|Hindi|English|NF|WEB-?DL|WEBRip|HDRip|BluRay|HDTV|x264|H\.?(?:264|265)|HEVC|AAC|DDP|DD|MSubs|SDR|HDR|Dolby\s*Vision)\b",
+        " ",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"\b\d{3,4}p\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip(" -._")
+    return t
+
+
+def _derive_title_from_episode_filename(file_text: str) -> str:
+    """Extract probable series title from filenames like 'Name - S01E08.ext'."""
+    if not file_text:
+        return ""
+
+    base = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", file_text)
+    m = re.match(r"^(.*?)\s*[-._ ]\s*S\d{1,2}E\d{1,2}\b", base, flags=re.IGNORECASE)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip(" -._")
+    return ""
 
 
 @router.post("/parse", response_model=TorrentResponse)
@@ -88,8 +124,13 @@ async def parse_torrent(query: TorrentQuery) -> TorrentResponse:
         imdb_is_series = resolved_is_series  # default from name/file heuristic
 
         if main.indexer:
+            imdb_title_query = _clean_imdb_search_title(parsed.title)
+            file_title_hint = _derive_title_from_episode_filename(torrent_file)
+            if file_title_hint:
+                imdb_title_query = file_title_hint
+
             results = main.indexer.search(
-                title=parsed.title,
+                title=imdb_title_query or parsed.title,
                 year=parsed.year,
                 is_series=None,   # let IMDb decide the type
                 threshold=0.7,
@@ -193,6 +234,10 @@ async def parse_torrent_with_ai(query: TorrentQuery) -> TorrentResponse:
 
         if main.indexer:
             search_title = metadata_data.get('title') or parsed.title
+            search_title = _clean_imdb_search_title(search_title)
+            file_title_hint = _derive_title_from_episode_filename(torrent_file)
+            if file_title_hint:
+                search_title = file_title_hint
             search_year = metadata_data.get('year') or parsed.year
 
             results = main.indexer.search(
